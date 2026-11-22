@@ -128,7 +128,7 @@ class BoardWidget(QWidget):
                 from collections import deque
                 W2, H2 = img.width(), img.height()
                 stride = img.bytesPerLine()
-                buf = img.constBits().asstring(img.sizeInBytes())   # ARGB32 内存序 BGRA
+                buf = bytes(img.constBits())[:img.sizeInBytes()]   # ARGB32 内存序 BGRA
                 transp = [[buf[y * stride + x * 4 + 3] == 0 for x in range(W2)]
                           for y in range(H2)]
                 # 从边缘泛洪：与外部连通的透明区 → outside
