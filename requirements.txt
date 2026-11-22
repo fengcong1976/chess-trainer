@@ -1,0 +1,5 @@
+# 中国象棋培训大师 依赖（版本钉自项目 venv site-packages dist-info）
+PySide6==6.12.0
+
+# 打包
+pyinstaller==6.22.3
