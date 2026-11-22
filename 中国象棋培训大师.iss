@@ -1,6 +1,6 @@
 ﻿; 中国象棋培训大师 — Inno Setup 安装脚本（免管理员权限安装）
 #define MyAppName "中国象棋培训大师"
-#define MyAppVersion "1.1.1"
+#define MyAppVersion "1.1.2"
 #define MyAppPublisher "深圳市创炫互动网络科技有限公司"
 #define MyAppURL "https://www.mrheedu.com"
 #define MyAppExeName "中国象棋培训大师.exe"
@@ -19,7 +19,7 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 DefaultGroupName={#MyAppName}
 SetupIconFile=app_icon.ico
 OutputDir=installer_output
-OutputBaseFilename=中国象棋培训大师-Setup-1.1.1
+OutputBaseFilename=中国象棋培训大师-Setup-1.1.2
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern

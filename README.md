@@ -115,7 +115,7 @@
 pip install -r requirements.txt
 ```
 
-> 依赖非常简单：`PyQt6 >= 6.6.0`
+> 依赖非常简单：`PySide6 >= 6.6.0`
 
 ### 2. （推荐）放置 Pikafish 引擎
 

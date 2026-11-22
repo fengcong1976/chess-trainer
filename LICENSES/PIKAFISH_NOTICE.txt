@@ -1,0 +1,3 @@
+Pikafish 象棋引擎与 NNUE 权重
+许可：GPL-3.0。源码地址：https://github.com/official-pikafish/Pikafish
+随包的 pikafish.exe 与 pikafish.nnue 未修改。GPL-3.0 全文见同目录。
