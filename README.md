@@ -188,3 +188,9 @@ python -m PyInstaller --clean --noconfirm "中国象棋培训大师.spec"
 本仓库只包含源码，以下运行时资源体积较大，未纳入仓库：
 
 - engine_bin/pikafish.nnue 与 开局书/*.obk（体积较大）：请从发布页或自行准备后放入对应目录。
+
+---
+
+## 更多免费软件
+
+本工具由深圳市创炫互动网络科技有限公司开发，官网提供免费安装包、图文教程，以及更多永久免费的 Windows 软件：**[www.mrheedu.com](https://www.mrheedu.com)**
