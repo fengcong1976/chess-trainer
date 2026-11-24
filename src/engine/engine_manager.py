@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 
 from ..board.board import Board
 from ..board.position import Pos, parse_ucci_move
+from ..board.pieces import Color
 from ..board import rules as _rules
 from .builtin_engine import BuiltinEngine
 from .opening_book import OpeningBook
@@ -167,11 +168,17 @@ class EngineManager:
 
     def analyze(self, board: Board, movetime_ms: int = 1500) -> dict:
         """同步分析当前局面，返回 {move, score_cp, pv, bestmove}。
-        支持 Pikafish 和内置引擎；会阻塞，应在工作线程调用。"""
+
+        score_cp 统一为**红方视角**（内置引擎本身就是红方视角；Pikafish 输出的是
+        走子方视角，这里按 board.side 取反），保证 UI 评分/复盘曲线方向一致。
+        会阻塞，应在工作线程调用。"""
         if self._use_pikafish and self._pikafish:
             with self._lock:
                 result = self._pikafish.analyze(board, movetime_ms=movetime_ms)
             if result:
+                sc = result.get("score_cp")
+                if sc is not None and board.side is Color.BLACK:
+                    result = dict(result, score_cp=-int(sc))
                 return result
         # Fallback: 内置引擎 analyze
         return self._builtin.analyze(board, movetime_ms=movetime_ms)

@@ -516,7 +516,7 @@ _PUZZLES = [
     ),
     # —— 闷宫·红兵当炮架 ——
     Puzzle(
-        id="mg002",
+        id="mj001",
         title="闷宫·兵作炮架",
         category="残局/闷宫",
         difficulty=4,
@@ -534,7 +534,7 @@ _PUZZLES = [
     ),
     # —— 车兵巧胜·困毙 ——
     Puzzle(
-        id="sf001",
+        id="cb005",
         title="车兵巧胜·困毙终局",
         category="残局/车兵",
         difficulty=3,

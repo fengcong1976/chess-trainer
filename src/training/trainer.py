@@ -111,10 +111,16 @@ class ProgressStore:
             try:
                 with open(self.path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                self.solved = data.get("solved", [])
-                self.attempts = data.get("attempts", {})
-                self.srs = data.get("srs", {})
-                self.current = data.get("current", {})
+                if not isinstance(data, dict):
+                    raise ValueError("progress root not dict")
+                solved = data.get("solved", [])
+                self.solved = [str(x) for x in solved] if isinstance(solved, list) else []
+                att = data.get("attempts", {})
+                self.attempts = att if isinstance(att, dict) else {}
+                srs = data.get("srs", {})
+                self.srs = srs if isinstance(srs, dict) else {}
+                cur = data.get("current", {})
+                self.current = cur if isinstance(cur, dict) else {}
             except Exception:
                 self.solved, self.attempts, self.srs, self.current = [], {}, {}, {}
 
@@ -148,7 +154,9 @@ class ProgressStore:
     # ---------- 错题本 / 间隔重复 ----------
     def record_wrong(self, pid: str):
         """答错：进入/重置错题本，今天即到期。"""
-        e = self.srs.get(pid) or {"iv": 0, "wrong": 0, "right": 0}
+        e = self.srs.get(pid)
+        if not isinstance(e, dict):
+            e = {"iv": 0, "wrong": 0, "right": 0}
         e["iv"] = 0
         e["wrong"] = e.get("wrong", 0) + 1
         e["due"] = date.today().isoformat()
@@ -158,8 +166,8 @@ class ProgressStore:
     def record_right(self, pid: str):
         """错题答对（通关）：复习间隔推进一级；走完间隔表即毕业移出。"""
         e = self.srs.get(pid)
-        if not e:
-            return  # 未进错题本的题答对不记录
+        if not isinstance(e, dict):
+            return  # 未进错题本（或被损坏数据污染）的题答对不记录
         e["right"] = e.get("right", 0) + 1
         e["iv"] = e.get("iv", 0) + 1
         if e["iv"] >= len(self.SRS_INTERVALS):

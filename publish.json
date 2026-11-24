@@ -32,9 +32,9 @@
     "license": "GPL-3.0"
   },
   "version": {
-    "version_number": "1.1.2",
+    "version_number": "1.1.3",
     "min_os_version": "Windows 10",
-    "installer": "installer_output/中国象棋培训大师-Setup-1.1.2.exe",
-    "release_notes": "1.1.1 → 1.1.2：更新第三方组件许可声明与开源地址；修复若干已知问题。"
+    "installer": "installer_output/中国象棋培训大师-Setup-1.1.3.exe",
+    "release_notes": "1.1.2 → 1.1.3：修复导入 .bin/.obk 开局书时进度框一直卡在「正在展开」的问题；修正 OBK 开局库走法编码（此前开局课权重几乎全部失效），开局课程质量与多样性显著提升；修复对局结束后仍可落子/悔棋导致重复记战绩、执黑悔棋后轮不到自己、复盘时可误落子、切换执方时旧引擎着法串局、Pikafish 评分方向与意外退出崩溃等问题；训练进度文件损坏时不再崩溃。"
   }
 }

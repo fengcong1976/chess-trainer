@@ -49,7 +49,8 @@ class TrainingPlanStore:
             try:
                 with open(self.path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                self.days = data.get("days", {})
+                days = data.get("days", {}) if isinstance(data, dict) else {}
+                self.days = days if isinstance(days, dict) else {}
             except Exception:
                 self.days = {}
 
@@ -66,7 +67,10 @@ class TrainingPlanStore:
     def record(self, key: str, n: int = 1, day: date = None):
         """今日（或指定日）某类任务完成数 +n。"""
         k = self._day_key(day)
-        bucket = self.days.setdefault(k, {})
+        bucket = self.days.get(k)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            self.days[k] = bucket
         bucket[key] = bucket.get(key, 0) + n
         self.save()
 

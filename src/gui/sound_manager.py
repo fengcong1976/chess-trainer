@@ -26,6 +26,7 @@ try:
     from ..resources import bundle_root, data_dir as _res_data_dir
     _SND_DIR = os.path.join(bundle_root(), "sounds")   # 打包后从解包资源读
 except ImportError:
+    _res_data_dir = None
     _SND_DIR = os.path.join(os.path.dirname(os.path.dirname(
         os.path.dirname(os.path.abspath(__file__)))), "sounds")
 # 打包后解包目录只读且 wav 已随包分发；若缺失（异常情况）落到可写 data/sounds 再合成

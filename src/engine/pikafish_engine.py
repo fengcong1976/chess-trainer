@@ -129,6 +129,12 @@ class PikafishEngine:
             return {}
         bestmove = raw.get("bestmove")
         info_lines = raw.get("info_lines", [])
+        # 超时未收到 bestmove：引擎还在搜索，必须发 stop 并吞掉它的 bestmove，
+        # 否则下一次 position/go 会与旧搜索交错，读到上一局面的着法。
+        if not bestmove:
+            self._send("stop")
+            self._read_until_bestmove_full(timeout=3)
+            return {}
         # 取最后一条含 score 的 info
         score_cp = None
         pv: list = []
@@ -139,6 +145,13 @@ class PikafishEngine:
                 if len(parts) > idx + 2 and parts[idx + 1] == "cp":
                     try:
                         score_cp = int(parts[idx + 2])
+                    except ValueError:
+                        pass
+                elif len(parts) > idx + 2 and parts[idx + 1] == "mate":
+                    try:
+                        mate_in = int(parts[idx + 2])
+                        # 将杀分：离将杀越近分越高（±30000 量级，与厘兵分可比）
+                        score_cp = (30000 - abs(mate_in)) * (1 if mate_in > 0 else -1)
                     except ValueError:
                         pass
             if "pv" in parts:
@@ -155,9 +168,14 @@ class PikafishEngine:
 
     # ---- 底层 IO ----
     def _send(self, cmd: str):
-        if self._proc and self._proc.stdin:
-            self._proc.stdin.write(cmd + "\n")
-            self._proc.stdin.flush()
+        """向引擎写入一行；进程已退出/管道断开时置 is_ready=False 并忽略。"""
+        try:
+            proc = self._proc
+            if proc and proc.stdin and proc.poll() is None:
+                proc.stdin.write(cmd + "\n")
+                proc.stdin.flush()
+        except Exception:
+            self.is_ready = False
 
     def _wait_for(self, token: str, timeout: float = 10) -> bool:
         end_time = _now() + timeout

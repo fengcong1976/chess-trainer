@@ -56,6 +56,7 @@ class BoardWidget(QWidget):
         self.flipped: bool = False            # 视角翻转（黑方在下）
         self.player_color: Color = Color.RED  # 可操作方
         self.interactive: bool = True         # 是否允许用户操作
+        self.hard_locked: bool = False        # 复盘/终局：即使轮到己方也禁止落子
 
         self._selected: Optional[Pos] = None
         self._legal_targets: List[Pos] = []
@@ -248,6 +249,14 @@ class BoardWidget(QWidget):
     def set_interactive(self, on: bool):
         self.interactive = on
         if not on:
+            self._selected = None
+            self._legal_targets = []
+            self.update()
+
+    def set_hard_lock(self, on: bool):
+        """硬锁：复盘/终局时使用。mousePressEvent 的“自救”逻辑也不放行。"""
+        self.hard_locked = bool(on)
+        if on:
             self._selected = None
             self._legal_targets = []
             self.update()
@@ -639,6 +648,9 @@ class BoardWidget(QWidget):
                 f"💡 现在轮到{side_txt}方走 {engine_txt}（你执{you_txt}），等对方走完再点你的棋")
             return
         if not self.interactive:
+            if self.hard_locked:
+                self.hintMessage.emit("👁 当前是复盘/观棋状态，不能落子（点「✕ 退出复盘」或「⟳ 新局」继续下棋）")
+                return
             self.interactive = True
 
         pos = self._from_pixel(event.position())

@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-VERSION = '1.1.2'
+VERSION = '1.1.3'
 COMPANY = '深圳市创炫互动网络科技有限公司'
 WEBSITE = 'www.mrheedu.com'
 WEBSITE_URL = 'https://www.mrheedu.com'

@@ -48,10 +48,11 @@ class _EngineWorker(QObject):
     """在工作线程中调用引擎求最佳走法。"""
     finished = Signal(object)   # (frm_pos, to_pos) 或 None
 
-    def __init__(self, engine: EngineManager, board: Board):
+    def __init__(self, engine: EngineManager, board: Board, token: int = 0):
         super().__init__()
         self._engine = engine
         self._board = board
+        self.token = token      # 对局代际：新局/换执方后旧请求作废
 
     def run(self):
         try:
@@ -355,6 +356,8 @@ class MainWindow(QMainWindow):
 
     # 后台开局书导入完成（跨线程通知主线程刷新课程下拉框）
     auto_import_done = Signal()
+    # 手动导入解析完成（lessons, warns, 文件路径, 进度对话框）——跨线程回主线程
+    book_import_done = Signal(object, object, str, object)
 
     def __init__(self, engine_manager: EngineManager,
                  plan_path: str = None, stats_path: str = None):
@@ -404,7 +407,11 @@ class MainWindow(QMainWindow):
         self._eval_thread: Optional[QThread] = None
         self._eval_worker: Optional[_EngineAnalyzeWorker] = None
         self._thinking = False
+        self._game_token = 0             # 对局代际：新局/换执方后旧引擎回招作废
+        self._bg_threads: list = []      # 保活运行中的 QThread，防止被 GC 提前析构
+        self._bg_workers: list = []      # 对应 worker 保活，线程结束后统一 deleteLater
         self._board_fullscreen = False   # 棋盘全屏状态标志
+        self._closing = False            # 窗口关闭中：后台线程不再回发信号
 
         self._build_ui()
         self._build_menu()
@@ -747,6 +754,8 @@ class MainWindow(QMainWindow):
         self._auto_import_running = False
         # 后台静默导入完成后刷新课程下拉框（信号跨线程，不用 QTimer）
         self.auto_import_done.connect(self._refresh_cmb_lesson)
+        # 手动导入解析完成 → 主线程弹预览确认框
+        self.book_import_done.connect(self._after_book_imported)
         self._refresh_cmb_lesson()
         # 启动时自动静默导入「开局书/」目录下的 .bin/.obk 作为开局课（后台线程，不阻塞窗口出现）
         QTimer.singleShot(200, self._start_auto_import_thread)
@@ -1100,7 +1109,8 @@ class MainWindow(QMainWindow):
         状态条三者还是要按 side 的真实值走——否则用户明明"轮到他了"却永远点不动。
         （真卡住时 mousePressEvent 已经会放行，这里再做 state 层同步。）
         """
-        should_enable = (self.board.side is self.player_color)
+        should_enable = (self.board.side is self.player_color
+                         and not self._game_over and self.mode == self.PLAY_MODE)
         self.board_widget.set_interactive(should_enable)
         if should_enable:
             # 清掉可能残留的"引擎思考中…"状态栏永久文字
@@ -1115,6 +1125,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(delay_ms, self._force_sync_interactive)
 
     def start_play(self):
+        self._leave_review_if_needed()
         self.mode = self.PLAY_MODE
         self.session = None
         self.sf_session = None
@@ -1126,6 +1137,7 @@ class MainWindow(QMainWindow):
         # 重置跨局状态标志（上一局终局后可能残留 True）
         self._over_flag = False
         self._thinking = False
+        self._game_token += 1      # 作废在途的引擎回招（新局/换执方）
 
         # 读取"执方"下拉框：我执红先手 / 我执黑后手
         if hasattr(self, "cmb_side"):
@@ -1147,6 +1159,7 @@ class MainWindow(QMainWindow):
         self.board_widget.set_player_color(self.player_color)
         # 翻转棋盘：执黑时让自己的黑子在下方，敌方红子在上方（模拟真实对弈视角）
         self.board_widget.flip(self.player_color is Color.BLACK)
+        self.board_widget.set_hard_lock(False)
         self.board_widget.set_board(self.board)
         self.lbl_suggest.setText("")
         self._update_turn_label()
@@ -1209,6 +1222,7 @@ class MainWindow(QMainWindow):
 
     def _load_puzzle(self, pid: str):
         from ..training.trainer import get_puzzle
+        self._leave_review_if_needed()
         puzzle = get_puzzle(pid)
         self.progress.set_current("endgame", pid)   # 保存训练进度
         self.mode = self.TRAIN_MODE
@@ -1227,6 +1241,7 @@ class MainWindow(QMainWindow):
         self.tactics_box.setVisible(False)
         self.player_color = Color.RED
         self.board_widget.set_player_color(Color.RED)
+        self.board_widget.set_hard_lock(False)
         self.board_widget.set_interactive(True)
         self.board_widget.flip(False)
         self.board_widget.set_board(self.board)
@@ -1372,8 +1387,13 @@ class MainWindow(QMainWindow):
         return self.cmb_lesson
 
     def start_opening_default(self):
-        self.mode = self.OPENING_MODE
         cmb = self._active_lesson_combo()
+        if not cmb.currentData():
+            # 该来源分组暂无课程：不改模式/面板，避免出现"棋盘点了没反应"的假死
+            self.status.showMessage(
+                "该分组暂无开局课：请先导入 .bin/.obk 开局书，或切回「🏛 内置课程」。", 6000)
+            return
+        self.mode = self.OPENING_MODE
         # 恢复上次训练到的课程（在所有 source 中找）
         saved = self.progress.get_current("opening")
         if saved:
@@ -1396,6 +1416,7 @@ class MainWindow(QMainWindow):
         if not lid:
             self.status.showMessage("该分组暂无课程，请先导入 .bin/.obk 开局书", 3000)
             return
+        self._leave_review_if_needed()
         from ..training.opening_book import lesson_by_id
         lesson = lesson_by_id(lid)
         self.progress.set_current("opening", lid)   # 保存训练进度
@@ -1416,6 +1437,7 @@ class MainWindow(QMainWindow):
         side_cn = "红" if lesson.side is Color.RED else "黑"
         self.player_color = lesson.side
         self.board_widget.set_player_color(lesson.side)
+        self.board_widget.set_hard_lock(False)
         self.board_widget.set_interactive(True)
         self.board_widget.flip(False)
         self.board_widget.set_board(self.board)
@@ -1566,6 +1588,7 @@ class MainWindow(QMainWindow):
 
     def _load_tactic(self, tid: str):
         from ..training.midgame_puzzles import tactic_by_id
+        self._leave_review_if_needed()
         tactic = tactic_by_id(tid)
         self.progress.set_current("midgame", tid)   # 保存训练进度
         self.mode = self.MIDGAME_MODE
@@ -1585,6 +1608,7 @@ class MainWindow(QMainWindow):
         side_cn = "红" if tactic.side is Color.RED else "黑"
         self.player_color = tactic.side
         self.board_widget.set_player_color(tactic.side)
+        self.board_widget.set_hard_lock(False)
         self.board_widget.set_interactive(True)
         self.board_widget.flip(False)
         self.board_widget.set_board(self.board)
@@ -1721,6 +1745,7 @@ class MainWindow(QMainWindow):
 
     def _load_sf_puzzle(self, pid: str):
         from ..training.tactics_puzzles import tactics_puzzle_by_id
+        self._leave_review_if_needed()
         puzzle = tactics_puzzle_by_id(pid)
         self.progress.set_current("tactics", pid)   # 保存训练进度
         self.mode = self.TACTICS_MODE
@@ -1739,6 +1764,7 @@ class MainWindow(QMainWindow):
         self.tactics_box.setVisible(True)
         self.player_color = Color.RED
         self.board_widget.set_player_color(Color.RED)
+        self.board_widget.set_hard_lock(False)
         self.board_widget.set_interactive(True)
         self.board_widget.flip(False)
         self.board_widget.set_board(self.board)
@@ -2111,6 +2137,10 @@ class MainWindow(QMainWindow):
 
 
     def _handle_play_move(self, frm: Pos, to: Pos):
+        # 终局后（将死/困毙/认输/和棋）不再接受落子，避免重复结算
+        if self._game_over:
+            self.status.showMessage("本局已结束，请点「⟳ 新局」开下一盘。", 3000)
+            return
         # —— 回合真实性校验（不再依赖 _thinking 标志） ——
         if self.board.side is not self.player_color:
             self.status.showMessage(
@@ -2205,6 +2235,32 @@ class MainWindow(QMainWindow):
                                     last_move_by=mover)
         self._update_turn_label()
 
+    def _keep_thread(self, th: QThread, worker=None, attr: str = None):
+        """持有运行中的 QThread / worker 引用，线程结束后自动释放。
+        防止 self._engine_thread 被新请求覆盖后，旧线程对象被 GC 提前析构
+        （Qt 会 abort：QThread: Destroyed while thread is still running）。"""
+        if th is None:
+            return
+        if th not in self._bg_threads:
+            self._bg_threads.append(th)
+        if worker is not None:
+            self._bg_workers.append(worker)
+
+        def _done():
+            for lst, obj in ((self._bg_threads, th), (self._bg_workers, worker)):
+                if obj is not None:
+                    try:
+                        lst.remove(obj)
+                    except ValueError:
+                        pass
+            if attr and getattr(self, attr, None) is th:
+                setattr(self, attr, None)
+            if worker is not None:
+                worker.deleteLater()
+            th.deleteLater()
+
+        th.finished.connect(_done)
+
     def _request_engine_move(self):
         if self._thinking:
             return
@@ -2215,28 +2271,42 @@ class MainWindow(QMainWindow):
         self.status.showMessage("引擎思考中…", 3000)
 
         self._engine_thread = QThread()
-        self._engine_worker = _EngineWorker(self.engine, self.board.clone())
+        self._engine_worker = _EngineWorker(self.engine, self.board.clone(), self._game_token)
         self._engine_worker.moveToThread(self._engine_thread)
         self._engine_thread.started.connect(self._engine_worker.run)
         self._engine_worker.finished.connect(self._on_engine_reply)
         self._engine_worker.finished.connect(self._engine_thread.quit)
         self._engine_thread.start()
+        self._keep_thread(self._engine_thread, self._engine_worker, attr="_engine_thread")
 
         # 引擎 15 秒看门狗：Pikafish 异常卡死或信号丢了 → 强制把交互还给用户。
+        # 只对「本回合」的请求生效（换局/换执方后旧看门狗不再误伤）。
+        token = self._game_token
+
         def _wd():
-            if getattr(self, "_thinking", False):
+            if getattr(self, "_thinking", False) and token == self._game_token:
                 self.status.showMessage("⏱ 引擎响应超时，已解锁棋盘。可点「🔄 新局」重开一局。", 6000)
                 self._thinking = False
                 self._force_sync_interactive()
         QTimer.singleShot(15000, _wd)
 
     def _on_engine_reply(self, move):
+        # 旧对局/旧执方的在途回招直接丢弃（否则会走子到新棋盘/训练棋盘上）
+        tok = getattr(self.sender(), "token", None)
+        if tok is not None and tok != self._game_token:
+            return
         self._thinking = False
+        if self.mode != self.PLAY_MODE:
+            return
         if move is None:
             self.status.showMessage("引擎无走法（可能已终局）", 4000)
             self._force_sync_interactive()
             return
         frm, to = move
+        if self._game_over or not rules.is_legal(self.board, frm, to):
+            # 局面已变（复盘/新局/看门狗解锁）→ 丢弃这步，避免棋子丢失
+            self._force_sync_interactive()
+            return
         self._apply_move(frm, to, animate=True)
         self._check_game_over_play()
         if self._game_over:
@@ -2323,6 +2393,7 @@ class MainWindow(QMainWindow):
         self._analyze_worker.finished.connect(self._on_suggestion)
         self._analyze_worker.finished.connect(self._analyze_thread.quit)
         self._analyze_thread.start()
+        self._keep_thread(self._analyze_thread, self._analyze_worker, attr="_analyze_thread")
 
     def _on_suggestion(self, info: dict):
         self.btn_suggest.setEnabled(True)
@@ -2515,6 +2586,7 @@ class MainWindow(QMainWindow):
             winner = side.opponent.name_cn
             self._over_flag = True
             self.board_widget.set_interactive(False)
+            self.board_widget.set_hard_lock(True)
             you_won = side is not self.player_color
             # 战绩统计 + 每日计划实战任务自动 +1 + 自动存谱
             self.play_stats.record("win" if you_won else "loss")
@@ -2558,6 +2630,7 @@ class MainWindow(QMainWindow):
         # 复用终局处理流程（_check_game_over_play 用的是 record("win"/"loss")）
         self._over_flag = True
         self.board_widget.set_interactive(False)
+        self.board_widget.set_hard_lock(True)
         self.play_stats.record("loss")
         self.plan_store.record("play")
         self._save_current_game("loss")
@@ -2596,6 +2669,7 @@ class MainWindow(QMainWindow):
         self._draw_worker.finished.connect(self._on_draw_evaluated)
         self._draw_worker.finished.connect(self._draw_thread.quit)
         self._draw_thread.start()
+        self._keep_thread(self._draw_thread, self._draw_worker, attr="_draw_thread")
 
     # 引擎优势阈值（红方视角 score_cp）
     # |cp| < 200 → 引擎认为均势，同意和棋
@@ -2628,6 +2702,7 @@ class MainWindow(QMainWindow):
         """求和被接受后的统一终局处理。"""
         self._over_flag = True
         self.board_widget.set_interactive(False)
+        self.board_widget.set_hard_lock(True)
         self.play_stats.record("draw")
         self.plan_store.record("play")
         self._save_current_game("draw")
@@ -2712,6 +2787,9 @@ class MainWindow(QMainWindow):
 
     def _enter_review(self, game: dict):
         """进入复盘：保存对弈现场，载入棋谱回放。"""
+        if self._review:
+            self.status.showMessage("已在复盘中，请先点「✕ 退出复盘」", 3000)
+            return
         if self._thinking or (self._engine_thread and self._engine_thread.isRunning()):
             self.status.showMessage("引擎工作中，请稍候再进入复盘", 3000)
             return
@@ -2738,6 +2816,7 @@ class MainWindow(QMainWindow):
         self.review_bar.show()
         self.score_curve.reset()
         self.board_widget.set_interactive(False)
+        self.board_widget.set_hard_lock(True)   # 复盘禁止落子（mousePressEvent 自救也不放行）
         self.status.showMessage("复盘模式：◀▶ 逐步回放，⚡评估后自动标出败着", 6000)
         self._review_goto(0)
 
@@ -2830,6 +2909,23 @@ class MainWindow(QMainWindow):
         else:
             self.move_list.setCurrentRow(-1)
 
+    def _leave_review_if_needed(self):
+        """切换到其它对弈/训练模式前清理复盘状态（否则假棋谱和复盘工具条会污染新模式）。"""
+        if not getattr(self, "_review", None):
+            return
+        self._stop_review_eval()
+        self._review_play_timer.stop()
+        if hasattr(self, "btn_rev_play"):
+            self.btn_rev_play.setChecked(False)
+            self.btn_rev_play.setText("▶ 自动播放")
+        self._review = None
+        self._play_snapshot = None
+        if hasattr(self, "review_bar"):
+            self.review_bar.hide()
+        if hasattr(self, "lbl_suggest"):
+            self.lbl_suggest.show()
+        self.board_widget.set_hard_lock(False)
+
     def _review_exit(self):
         """退出复盘：停止评估/播放，恢复对弈现场。"""
         self._stop_review_eval()
@@ -2842,7 +2938,9 @@ class MainWindow(QMainWindow):
             self.board, self.history, self._over_flag = self._play_snapshot
             self._play_snapshot = None
         self.review_bar.hide()
-        can_play = (self.mode == self.PLAY_MODE and self.board.side == self.player_color)
+        can_play = (self.mode == self.PLAY_MODE and self.board.side == self.player_color
+                    and not self._game_over)
+        self.board_widget.set_hard_lock(self._game_over)
         self.board_widget.set_board(self.board)
         self.board_widget.set_interactive(can_play)
         self.board_widget.clear_highlights()
@@ -2985,6 +3083,9 @@ class MainWindow(QMainWindow):
     def undo_move(self):
         if self.mode != self.PLAY_MODE or self._thinking:
             return
+        if self._game_over:
+            self.status.showMessage("本局已结束，不能悔棋。请点「⟳ 新局」开下一盘。", 3000)
+            return
         # 悔到上次轮到用户：撤销引擎+用户两步
         steps = 0
         while self.history and steps < 2:
@@ -2996,6 +3097,12 @@ class MainWindow(QMainWindow):
         self._refresh_move_list()
         self.board_widget.set_board(self.board)
         self._update_turn_label()
+        # 执黑开局只有引擎一步：悔棋后回到红方回合，必须让引擎重走，否则永远轮不到玩家
+        if self.board.side is not self.player_color:
+            self.status.showMessage("已悔棋，引擎重新走第一步…", 2000)
+            self._thinking = False
+            self._request_engine_move()
+            return
         self.board_widget.set_interactive(True)
         self.status.showMessage("已悔棋", 2000)
 
@@ -3139,7 +3246,12 @@ class MainWindow(QMainWindow):
         finally:
             self._auto_import_running = False
             # 无论成败都刷新一次，清除“后台导入中…”占位（信号跨线程）
-            self.auto_import_done.emit()
+            # 窗口已关闭时不再 emit，避免向已销毁的 QObject 发信号导致退出崩溃
+            if not self._closing:
+                try:
+                    self.auto_import_done.emit()
+                except RuntimeError:
+                    pass
 
     def _auto_import_impl(self):
         """启动静默导入：扫描「开局书/」目录（exe旁/项目根）下所有 .bin/.obk → 最多注入 200 条开局课（用户无感）。"""
@@ -3296,7 +3408,11 @@ class MainWindow(QMainWindow):
         prog_d = None
         try:
             from PySide6.QtWidgets import QProgressDialog
-            prog_d = QProgressDialog(f"正在展开《{os.path.basename(fname)}》…", None, 0, 0, self)
+            prog_d = QProgressDialog(
+                f"正在展开《{os.path.basename(fname)}》…\n"
+                "大开局库首次解析可能需要几分钟，请稍候（之后会秒开）。",
+                None, 0, 0, self)
+            prog_d.setWindowTitle("开局书导入")
             prog_d.setWindowModality(Qt.WindowModality.WindowModal)
             prog_d.setMinimumDuration(0)
             prog_d.show()
@@ -3306,6 +3422,7 @@ class MainWindow(QMainWindow):
         is_obk = fname.lower().endswith(".obk")
 
         def worker():
+            lessons, warns = [], []
             try:
                 from ..training.opening_book import bin_to_lessons, obk_to_lessons
                 if is_obk:
@@ -3322,16 +3439,16 @@ class MainWindow(QMainWindow):
                     )
             except Exception as e:  # noqa: BLE001
                 lessons, warns = [], [f"解析异常：{e!r}"]
-            QTimer.singleShot(
-                0,
-                lambda: self._after_book_imported(lessons, warns, fname, prog_d),
-            )
+            finally:
+                # 工作线程无事件循环，QTimer.singleShot 不会触发，必须用信号回主线程
+                self.book_import_done.emit(lessons, warns, fname, prog_d)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _after_book_imported(self, lessons, warns, fname: str, prog):
         if prog is not None:
             prog.cancel()
+            prog.deleteLater()
         import os
         base = os.path.basename(fname)
         is_obk = fname.lower().endswith(".obk")
@@ -3345,6 +3462,17 @@ class MainWindow(QMainWindow):
             else:
                 msg += "\n提示：请确认是「中国象棋专用 Polyglot .bin」（非国际象棋）。"
             QMessageBox.warning(self, f"{fmt_tag} 导入结果", msg)
+            return
+        # 去重：内容相同的课（id 由谱链哈希生成）已在库中，就不再重复追加
+        from ..training.opening_book import all_lessons
+        existing_ids = {l.id for l in all_lessons()}
+        dup_cnt = sum(1 for l in lessons if l.id in existing_ids)
+        lessons = [l for l in lessons if l.id not in existing_ids]
+        if not lessons:
+            QMessageBox.information(
+                self, f"{fmt_tag} 导入结果",
+                f"《{base}》展开出的 {dup_cnt} 门开局课已经在训练库中（含启动时自动导入的），\n"
+                "无需重复导入。")
             return
         # 统计：课程数/步数范围/分类分布
         total_steps = sum(len(l.moves) for l in lessons)
@@ -3532,13 +3660,21 @@ th { background: #ecf0f1; }
                    icon_path=icon_path if icon_path.is_file() else None)
 
     def closeEvent(self, event):
-        # 依次停掉所有工作线程
-        for th in (self._engine_thread, self._analyze_thread, self._review_eval_thread,
-                   self._mateline_thread, self._eval_thread):
-            if th and th.isRunning():
-                th.quit()
-                th.wait(2000)
-        # 关闭引擎子进程，防止 pikafish.exe 残留
+        self._closing = True
+        # 先让工作线程收尾（此时引擎仍可用，分析会正常返回），再关引擎子进程。
+        # 顺序不能反：先杀引擎会让正在 analyze 的线程读到半截管道，退出时更易崩溃。
+        threads = [
+            self._engine_thread, self._analyze_thread, self._review_eval_thread,
+            self._mateline_thread, self._eval_thread,
+            getattr(self, "_draw_thread", None),
+        ] + list(getattr(self, "_bg_threads", []))
+        for th in threads:
+            try:
+                if th is not None and th.isRunning():
+                    th.quit()
+                    th.wait(2000)
+            except RuntimeError:
+                pass   # C++ 对象已销毁
         try:
             self.engine.shutdown()
         except Exception:

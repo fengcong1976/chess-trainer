@@ -10,6 +10,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('app_icon.ico', '.'),
+        ('app_icon.png', '.'),
         ('鼠标图片.png', '.'),
         ('engine_bin\\pikafish.exe', 'engine_bin'),
         ('engine_bin\\pikafish.nnue', 'engine_bin'),

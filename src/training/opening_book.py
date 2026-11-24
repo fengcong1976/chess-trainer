@@ -1133,7 +1133,6 @@ def bin_to_lessons(
       2) 每条 ≥ min_steps（默认 8 步）的独立走子链生成 1 课；
       3) 最多生成 max_lessons 课（默认100）避免大库卡死。
     """
-    import time as _t
     from ..board.board import Board
     from ..board.position import parse_ucci_move
     from ..board import rules as _rules
@@ -1145,7 +1144,6 @@ def bin_to_lessons(
         return [], [f"无法加载 .bin 开局书：{bin_path}"]
 
     warnings: list[str] = []
-    stamp = str(int(_t.time() * 1000) % 1_000_000)
 
     def _board_from_moves(mvs: list[str]) -> Board:
         bb = Board.start_position()
@@ -1282,7 +1280,7 @@ def bin_to_lessons(
             "建议把同一分类下的多条谱链都练熟，形成开局面覆盖。"
         )
         wrapped.append(OpeningLesson(
-            id=f"{start_id_prefix}_{stamp}_{i+1}",
+            id=_chain_lesson_id(start_id_prefix, mvs),
             title=title,
             category=cat,
             difficulty=difficulty,
@@ -1302,18 +1300,33 @@ def inject_lessons(extra: list[OpeningLesson]) -> None:
     _LESSONS.extend(extra)
 
 
+def _chain_lesson_id(prefix: str, moves: list[str]) -> str:
+    """按谱链内容生成稳定 id：重启/缓存重建后 id 不变，训练进度不会清零；
+    同一谱链重复导入也不会产生重复课。"""
+    import hashlib
+    h = hashlib.md5(" ".join(moves).encode("utf-8")).hexdigest()[:10]
+    return f"{prefix}_{h}"
+
+
 # ---------------------------------------------------------------------------
 # 秦大象棋 OBK (.obk) 开局库 → OpeningLesson 批量导入（SQLite 版 OBK）
 # ---------------------------------------------------------------------------
 def _obk_load_move_weights(obk_path: str) -> dict:
     """从 SQLite 版 OBK（bhobk 表）聚合出 move_int → (正权重, 胜, 和, 负)。
 
-    利用：OBK 的 vmove 整数编码与全球 Xiangqi Polyglot 4bit 编码一致。
+    利用：OBK 的 vmove 整数编码与 _move_int_from_pos 一致（16×16 格编码，
+    另有少数库用 Polyglot 4bit，运行时自动探测）。
     胜/和/负统计用于真实难度分层（和棋率高=平稳定式；胜负分明+低频=飞刀）。
     """
     import sqlite3
+    con = None
     try:
-        con = sqlite3.connect(obk_path)
+        # 只读 + immutable 打开：不在「开局书/」目录生成 -wal/-shm（安装目录可能只读）
+        uri = "file:" + obk_path.replace("\\", "/") + "?mode=ro&immutable=1"
+        try:
+            con = sqlite3.connect(uri, uri=True, timeout=10)
+        except Exception:
+            con = sqlite3.connect(obk_path)
         cur = con.cursor()
         # 直接用 SQL 聚合，一次性返回，避免 Python 遍历 233 万行
         cur.execute("""
@@ -1339,15 +1352,38 @@ def _obk_load_move_weights(obk_path: str) -> dict:
         return {"__err__": str(e)}
 
 
-def _move_int_from_pos(frm, to) -> int:
-    """Pos(frm, to) → Xiangqi Polyglot move 整数编码（和 OBK vmove 同编码）。
-    ff=frm.col, fr=9-frm.row, tf=to.col, tr=9-to.row; mv = (ff<<12)|(fr<<8)|(tf<<4)|tr
+def _move_int_from_pos(frm, to, grid16: bool = True) -> int:
+    """Pos(frm, to) → OBK vmove 整数编码。
+
+    秦大 OBK 的 vmove 实际是 16×16 棋盘格编码：
+        ((row+3)*16 + (col+3)) << 8 | ((trow+3)*16 + (tcol+3))
+    少数库沿用 Polyglot 4bit 编码 (ff<<12)|(fr<<8)|(tf<<4)|tr。
+    实测玫瑰飞刀库首着 44 步按 16×16 全命中、按 4bit 仅命中 3 步，
+    故默认 16×16，并对具体库自动探测（见 _detect_move_encoding）。
     """
+    if grid16:
+        return (((frm.row + 3) * 16 + (frm.col + 3)) << 8) | \
+               ((to.row + 3) * 16 + (to.col + 3))
     ff = frm.col & 0xF
     fr = (9 - frm.row) & 0xF
     tf = to.col & 0xF
     tr = (9 - to.row) & 0xF
     return (ff << 12) | (fr << 8) | (tf << 4) | tr
+
+
+def _detect_move_encoding(wmap: dict) -> bool:
+    """按起始局面 44 个合法首着在库中的命中数，判断该库 vmove 用哪种编码。
+    返回 True = 16×16 格编码，False = Polyglot 4bit 编码。"""
+    from ..board.board import Board as _B
+    from ..board import rules as _r
+    b = _B.start_position()
+    hits16 = hits4 = 0
+    for frm, to in _r.generate_legal_moves(b, b.side):
+        if _move_int_from_pos(frm, to, True) in wmap:
+            hits16 += 1
+        if _move_int_from_pos(frm, to, False) in wmap:
+            hits4 += 1
+    return hits16 >= hits4
 
 
 # 常见开局主招（前10步）的额外大奖励：强制把这些招顶到候选前列，解决「全局聚合权重被烂步淹没」问题
@@ -1412,25 +1448,22 @@ _MAIN_OPENING_BONUS: dict[str, int] = {
 }
 
 
-def _cands_from_wmap(board, wmap: dict, topk: int = 10, ply_hint: int = 0):
+def _cands_from_wmap(board, wmap: dict, topk: int = 10, ply_hint: int = 0,
+                     grid16: bool = True):
     """当前 board 上所有合法走子 → 查 wmap 权重 → 加上开局主招大奖励/惩罚 → 按权重降序取 topk。
     ply_hint: 当前半步深度（0=start,1=黑1...），用于惩罚逻辑分级。
+    grid16: 该库 vmove 是否为 16×16 格编码（由 _detect_move_encoding 探测）。
     返回 (ucci, final_w, stats) 三元组列表；stats=(base_w, win, draw, lost) 供难度分层。
     """
-    from ..board import rules as _rules
     from ..board.rules import generate_legal_moves
     from ..board.pieces import PieceType as _PT, Color as _CLR
     cands = []
     side = getattr(board, "side", None) or getattr(board, "turn", None)
+    # generate_legal_moves 已过滤「走后被将军」，无需再逐招 is_legal 复核
     moves = generate_legal_moves(board, side)
     EARLY = ply_hint < 14
     for frm, to in moves:
-        try:
-            if not _rules.is_legal(board, frm, to):
-                continue
-        except Exception:
-            continue
-        mvi = _move_int_from_pos(frm, to)
+        mvi = _move_int_from_pos(frm, to, grid16)
         t = wmap.get(mvi)
         if t is not None:
             base_w, bwin, bdraw, blost = int(t[0]), int(t[1]), int(t[2]), int(t[3])
@@ -1476,6 +1509,20 @@ def _cands_from_wmap(board, wmap: dict, topk: int = 10, ply_hint: int = 0):
     return uniq
 
 
+def _obk_cache_path(obk_path: str) -> str:
+    """缓存落盘路径：优先用户数据目录（安装目录可能只读），失败退回书文件旁。"""
+    import hashlib
+    import os as _os
+    try:
+        from ..resources import data_dir
+        d = _os.path.join(data_dir(), "bookcache")
+        _os.makedirs(d, exist_ok=True)
+        h = hashlib.md5(_os.path.abspath(obk_path).lower().encode("utf-8")).hexdigest()[:16]
+        return _os.path.join(d, f"{h}.pkl")
+    except Exception:
+        return obk_path + ".pkl.cache"
+
+
 def obk_to_lessons(
     obk_path: str,
     *,
@@ -1486,8 +1533,8 @@ def obk_to_lessons(
 ) -> tuple[list[OpeningLesson], list[str]]:
     """读入秦大 OBK 开局库 → 开局课（带本地 pickle 缓存）。
 
-    首次解析大文件（如 146MB 玫瑰飞刀库）约需百秒级；成功后把结果落盘到
-    `<obk文件>.pkl.cache`（含源文件大小/mtime+全部生成参数的 meta 校验），
+    首次解析大文件（如 146MB 玫瑰飞刀库）需数十秒；成功后把结果落盘到
+    data/bookcache/<hash>.pkl（含源文件路径/大小/mtime+全部生成参数的 meta 校验），
     之后每次启动直接反序列化秒载。任一条件变化（源文件更新/参数不同）
     自动失效重建。返回 (lessons, warnings)。
     """
@@ -1502,26 +1549,27 @@ def obk_to_lessons(
             "max_lessons": max_lessons,
             "min_steps": min_steps,
             "prefix": start_id_prefix,
-            "v": 2,  # 缓存格式版本：v2=含真难度分层（胜/和/负统计）
+            "src": _os.path.abspath(obk_path),
+            "v": 3,  # 缓存格式版本：v3=修正 OBK vmove 编码 + 谱链去重
         }
     except OSError:
         meta = None
-    cache_path = (obk_path + ".pkl.cache") if meta is not None else None
+    cache_path = _obk_cache_path(obk_path) if meta is not None else None
     if cache_path and _os.path.isfile(cache_path):
         try:
             with open(cache_path, "rb") as f:
                 blob = _pk.load(f)
             bm = blob.get("meta") or {}
             # 宽松命中：源文件一致 + 生成参数一致（max_lessons 不参与失效判定，
-            # 只要缓存课程数够用就截断返回——避免调用方动态请求数导致缓存反复失效）
-            if (bm.get("v") == 2
+            # 缓存够用就截断返回——避免调用方动态请求数导致缓存反复失效）
+            if (bm.get("v") == 3
+                    and bm.get("src") == meta["src"]
                     and bm.get("size") == meta["size"]
                     and bm.get("mtime") == meta["mtime"]
                     and bm.get("difficulty") == difficulty
                     and bm.get("min_steps") == min_steps
                     and bm.get("prefix") == start_id_prefix
-                    and blob.get("lessons")
-                    and len(blob["lessons"]) >= max_lessons):
+                    and blob.get("lessons")):
                 return blob["lessons"][:max_lessons], blob.get("warns", [])
         except Exception:
             pass  # 缓存损坏 → 走正常解析并重建
@@ -1530,12 +1578,17 @@ def obk_to_lessons(
         min_steps=min_steps, start_id_prefix=start_id_prefix,
     )
     if cache_path and lessons:
+        tmp = cache_path + ".tmp"
         try:
-            with open(cache_path, "wb") as f:
+            with open(tmp, "wb") as f:
                 _pk.dump({"meta": meta, "lessons": lessons, "warns": warns},
                          f, protocol=_pk.HIGHEST_PROTOCOL)
+            _os.replace(tmp, cache_path)   # 原子替换，避免并发写坏缓存
         except Exception:
-            pass
+            try:
+                _os.remove(tmp)
+            except OSError:
+                pass
     return lessons, warns
 
 
@@ -1548,7 +1601,6 @@ def _obk_to_lessons_impl(
     start_id_prefix: str = "obk",
 ) -> tuple[list[OpeningLesson], list[str]]:
     """真正的 OBK 解析实现（被 obk_to_lessons 的缓存层包装调用）。"""
-    import time as _t
     from ..board.board import Board
     from ..board.position import parse_ucci_move
     from ..board import rules as _rules
@@ -1562,8 +1614,10 @@ def _obk_to_lessons_impl(
         return [], [f"OBK move 聚合过少（仅 {len(wmap)} 条），非开局库 OBK 或表结构不兼容。"]
 
     warnings: list[str] = [f"OBK move 权重聚合 OK（{len(wmap):,} 个不同走子）"]
-    stamp = str(int(_t.time() * 1000) % 1_000_000)
-    MAX_DEPTH = 30
+    grid16 = _detect_move_encoding(wmap)
+    warnings.append("vmove 编码：" + ("16×16 格编码" if grid16 else "Polyglot 4bit"))
+    # 单课最多 16 半步（8 回合）：开局课练到出子成型即可，过长会互相收敛成同一局面
+    MAX_DEPTH = 16
     # 每条谱链的难度信号：tuple(chain) -> dict(avg_draw, avg_branch, trick)
     chain_sig: dict[tuple, dict] = {}
 
@@ -1577,16 +1631,23 @@ def _obk_to_lessons_impl(
         return bb
 
     def _greedy_chain(board0: Board, max_depth: int, cur_ply: int):
-        """贪心走主链，返回 (moves, sig)；sig=难度信号（和棋率/分叉/飞刀）。"""
+        """贪心走主链，返回 (moves, sig)；sig=难度信号（和棋率/分叉/飞刀）。
+
+        终止条件（防止生成兜圈谱链）：库中该局面已无权重记录、或局面重复出现。
+        """
         out: list[str] = []
         draws: list[float] = []
         branches: list[int] = []
         trick = False
         b = board0
         ply = cur_ply
+        visited = {b.to_fen()}
         for _ in range(max_depth):
-            lst = _cands_from_wmap(b, wmap, topk=5, ply_hint=ply)
+            lst = _cands_from_wmap(b, wmap, topk=5, ply_hint=ply, grid16=grid16)
             if not lst:
+                break
+            # 库外局面：所有候选都没有库权重（只剩 100 分兜底）→ 停止
+            if not any(st[0] > 0 for _u, _w, st in lst):
                 break
             mv_u = lst[0][0]
             base_w, bwin, bdraw, blost = lst[0][2]
@@ -1602,6 +1663,10 @@ def _obk_to_lessons_impl(
                 break
             out.append(mv_u)
             b.make_move(frm, to)
+            fen = b.to_fen()
+            if fen in visited:
+                break
+            visited.add(fen)
             ply += 1
         sig = {
             "avg_draw": (sum(draws) / len(draws)) if draws else 0.5,
@@ -1625,7 +1690,7 @@ def _obk_to_lessons_impl(
 
     start = Board.start_position()
     # 第一层：根招（起始局面第一手，取 TOP 12 个不同走子）
-    root_cands = _cands_from_wmap(start, wmap, topk=12, ply_hint=0)
+    root_cands = _cands_from_wmap(start, wmap, topk=12, ply_hint=0, grid16=grid16)
     collected: list[list[str]] = []
 
     def _chain_ok(ch: list[str]) -> bool:
@@ -1638,7 +1703,8 @@ def _obk_to_lessons_impl(
         if not _rules.is_legal(start, frm, to):
             continue
         try:
-            bd_branch = _board_from_moves([cand_ucci])
+            bd_branch = start.clone()
+            bd_branch.make_move(frm, to)
         except ValueError:
             continue
         tail, tail_sig = _greedy_chain(bd_branch, MAX_DEPTH - 1, 1)  # 已走1步=ply=1
@@ -1652,7 +1718,8 @@ def _obk_to_lessons_impl(
         for idx_step, uu in enumerate(full):
             if len(collected) >= max_lessons:
                 break
-            mid_cands = _cands_from_wmap(cur_bd, wmap, topk=10, ply_hint=len(cur_mvs))
+            mid_cands = _cands_from_wmap(cur_bd, wmap, topk=10,
+                                         ply_hint=len(cur_mvs), grid16=grid16)
             if len(mid_cands) >= 2:
                 branch_cands = mid_cands[1:]
                 for mc_ucci, _mc_w, _mc_st in branch_cands:
@@ -1662,7 +1729,8 @@ def _obk_to_lessons_impl(
                     if not _rules.is_legal(cur_bd, frm3, to3):
                         continue
                     try:
-                        bd_mid_branch = _board_from_moves(cur_mvs + [mc_ucci])
+                        bd_mid_branch = cur_bd.clone()   # 免去从起点重放整条链
+                        bd_mid_branch.make_move(frm3, to3)
                     except ValueError:
                         continue
                     mid_tail, mid_sig = _greedy_chain(
@@ -1680,9 +1748,9 @@ def _obk_to_lessons_impl(
             else:
                 break
 
-    # 去重
+    # 去重：同一走子顺序、或仅走子顺序不同但到达同一局面（换位）都只保留 1 条
     dedup: list[list[str]] = []
-    seen_chains: set[tuple] = set()
+    seen_positions: set[str] = set()
     safe_cnt = 0
     unsafe_skip = 0
     for ch in collected:
@@ -1698,10 +1766,10 @@ def _obk_to_lessons_impl(
         except Exception:
             unsafe_skip += 1
             continue
-        k = tuple(ch)
-        if k in seen_chains:
+        k = _bd_safe.to_fen()
+        if k in seen_positions:
             continue
-        seen_chains.add(k)
+        seen_positions.add(k)
         dedup.append(ch)
         if len(dedup) >= max_lessons:
             break
@@ -1760,7 +1828,7 @@ def _obk_to_lessons_impl(
             "同类型的飞刀分支要多练几条，实战中才能识别陷阱与反制手段。"
         )
         wrapped.append(OpeningLesson(
-            id=f"{start_id_prefix}_{stamp}_{i+1}",
+            id=_chain_lesson_id(start_id_prefix, mvs),
             title=title,
             category=cat,
             difficulty=real_diff,
